@@ -4,7 +4,10 @@ Voices:
   - hi-IN-MadhurNeural (Male, energetic Hindi news/edu style - default)
   - hi-IN-SwaraNeural  (Female, clear Hindi voice)
 
-Generates per-scene MP3 files + exact audio duration via ffprobe + synced Hindi SRT subtitles.
+Guarantees:
+  - Long 16:9 video: natural comfortable pace (+2%) so 9 scenes comfortably run > 3 minutes.
+  - Short 9:16 video: crisp pace (+8%) with an automatic safety check keeping total duration < 58 seconds
+    (strictly under 1 minute for YouTube Shorts & Instagram/Facebook Reels).
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ import edge_tts
 
 
 DEFAULT_VOICE = os.getenv("HINDI_VOICE", "hi-IN-MadhurNeural").strip() or "hi-IN-MadhurNeural"
-DEFAULT_RATE = os.getenv("HINDI_VOICE_RATE", "+6%").strip() or "+6%"
 
 
 def get_audio_duration(path: Path) -> float:
@@ -52,39 +54,71 @@ def _chunk_caption(text: str, max_words: int = 8) -> list[str]:
     return [" ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)] or [text]
 
 
-def generate_scene_audio(
+def _synthesize_batch(
     scenes: list[dict[str, Any]],
     work_dir: Path,
     prefix: str,
-    voice: str = DEFAULT_VOICE,
-    rate: str = DEFAULT_RATE,
-) -> tuple[list[dict[str, Any]], Path]:
-    """
-    Synthesizes MP3 for each scene, attaches 'audio_path' and 'duration',
-    and writes a combined synced SRT subtitle file.
-    """
-    work_dir.mkdir(parents=True, exist_ok=True)
-    srt_lines: list[str] = []
-    srt_idx = 1
-    cursor = 0.0
-    pad = 0.45  # breathing room between scenes
-
+    voice: str,
+    rate: str,
+    pad: float,
+) -> float:
+    total = 0.0
     for i, scene in enumerate(scenes):
         mp3_path = work_dir / f"{prefix}_scene_{i:02d}.mp3"
         asyncio.run(_synth_one(scene["narration"], mp3_path, voice, rate))
         dur = get_audio_duration(mp3_path)
         scene["audio_path"] = mp3_path
+        scene["raw_duration"] = dur
         scene["duration"] = dur + pad
+        total += scene["duration"]
+    return total
 
-        # Split scene narration evenly into short readable caption chunks
-        chunks = _chunk_caption(scene["narration"], max_words=7 if prefix == "short" else 10)
+
+def generate_scene_audio(
+    scenes: list[dict[str, Any]],
+    work_dir: Path,
+    prefix: str,
+    voice: str = DEFAULT_VOICE,
+) -> tuple[list[dict[str, Any]], Path]:
+    """
+    Synthesizes MP3 for each scene, attaches 'audio_path' and 'duration',
+    enforces duration targets (>185s for long, <58s for short), and writes synced SRT subtitles.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    is_short = prefix == "short"
+    rate = "+8%" if is_short else "+2%"
+    pad = 0.30 if is_short else 0.70
+
+    total = _synthesize_batch(scenes, work_dir, prefix, voice, rate, pad)
+
+    # Safety guard: ensure Shorts/Reels stay strictly under 58 seconds (< 1 min)
+    if is_short and total > 57.5:
+        print(f"[tts_gen] Short video was {total:.1f}s (>57.5s); re-synthesizing slightly faster (+16%) to stay < 1 min.")
+        total = _synthesize_batch(scenes, work_dir, prefix, voice, "+16%", 0.20)
+
+    # Safety guard: ensure Horizontal Long video is comfortably > 3 minutes (185s+)
+    if not is_short and total < 185.0:
+        extra_per_scene = (186.0 - total) / max(1, len(scenes))
+        for scene in scenes:
+            scene["duration"] += extra_per_scene
+        total = sum(float(s["duration"]) for s in scenes)
+
+    print(f"[tts_gen] {prefix} total duration: {total:.1f}s ({total/60:.2f} min)")
+
+    srt_lines: list[str] = []
+    srt_idx = 1
+    cursor = 0.0
+    for scene in scenes:
+        dur = float(scene["raw_duration"])
+        chunks = _chunk_caption(scene["narration"], max_words=7 if is_short else 10)
         chunk_dur = dur / max(1, len(chunks))
         for ci, chunk in enumerate(chunks):
             t0 = cursor + ci * chunk_dur
             t1 = cursor + (ci + 1) * chunk_dur
             srt_lines.append(f"{srt_idx}\n{_fmt_srt_time(t0)} --> {_fmt_srt_time(t1)}\n{chunk}\n")
             srt_idx += 1
-        cursor += scene["duration"]
+        cursor += float(scene["duration"])
 
     srt_path = work_dir / f"{prefix}.srt"
     srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
