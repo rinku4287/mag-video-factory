@@ -1,0 +1,83 @@
+name: Auto Hindi Video Factory (MAG)
+
+on:
+  repository_dispatch:
+    types: [new_update]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Render sample video only (skip YouTube/FB/IG upload)"
+        required: true
+        default: "true"
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  render-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install FFmpeg & Hindi (Devanagari) Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
+
+      - name: Install Python dependencies & Chromium
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Prepare payload JSON
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            printf '%s' "$DISPATCH_PAYLOAD" > payload.json
+          else
+            cp sample_payload.json payload.json
+          fi
+          cat payload.json
+
+      - name: Render Hindi Videos & Auto-Publish
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HINDI_VOICE: ${{ secrets.HINDI_VOICE }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: ${{ secrets.YT_PRIVACY }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          MAG_CALLBACK_SECRET: ${{ secrets.MAG_CALLBACK_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python scripts/pipeline.py --payload payload.json --out-dir out --dry-run
+          else
+            python scripts/pipeline.py --payload payload.json --out-dir out
+          fi
+
+      - name: Upload Rendered Videos as Workflow Artifacts (Preview / Backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-hindi-videos
+          path: |
+            out/*.mp4
+            out/script_bundle.json
+          retention-days: 7
