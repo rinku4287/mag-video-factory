@@ -1,8 +1,11 @@
 """
-Free Neural Hindi TTS Generator using Microsoft Edge TTS (edge-tts).
+Resilient Free Neural Hindi TTS Generator using Microsoft Edge TTS (edge-tts)
+with automatic retry/backoff + gTTS Hindi fallback so GitHub Actions jobs NEVER fail.
+
 Voices:
   - hi-IN-MadhurNeural (Male, energetic Hindi news/edu style - default)
-  - hi-IN-SwaraNeural  (Female, clear Hindi voice)
+  - hi-IN-SwaraNeural  (Female, clear Hindi voice - auto fallback)
+  - gTTS (hi / co.in)  (Last-resort fallback if Edge TTS rate-limits a runner IP)
 
 Guarantees:
   - Long 16:9 video: natural comfortable pace (+2%) so 9 scenes comfortably run > 3 minutes.
@@ -14,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +27,7 @@ import edge_tts
 
 
 DEFAULT_VOICE = os.getenv("HINDI_VOICE", "hi-IN-MadhurNeural").strip() or "hi-IN-MadhurNeural"
+ALT_VOICE = "hi-IN-SwaraNeural" if DEFAULT_VOICE != "hi-IN-SwaraNeural" else "hi-IN-MadhurNeural"
 
 
 def get_audio_duration(path: Path) -> float:
@@ -36,9 +42,49 @@ def get_audio_duration(path: Path) -> float:
     return max(2.5, float(out))
 
 
-async def _synth_one(text: str, out_mp3: Path, voice: str, rate: str) -> None:
+def _clean_tts_text(text: str) -> str:
+    text = re.sub(r"[\r\n\t]+", " ", text or "")
+    text = re.sub(r"[*_#`<>|]+", " ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text or "अधिक जानकारी के लिए myadmissionguru.com पर जाएं।"
+
+
+async def _edge_synth(text: str, out_mp3: Path, voice: str, rate: str) -> None:
     comm = edge_tts.Communicate(text=text, voice=voice, rate=rate)
     await comm.save(str(out_mp3))
+
+
+def _synth_one_resilient(text: str, out_mp3: Path, voice: str, rate: str) -> None:
+    clean = _clean_tts_text(text)
+    attempts = [
+        (voice, rate, 1.2),
+        (voice, "+0%", 2.5),
+        (ALT_VOICE, rate, 4.0),
+        (voice, "+0%", 6.0),
+    ]
+    last_err: Exception | None = None
+    for idx, (v, r, wait_s) in enumerate(attempts, start=1):
+        try:
+            asyncio.run(_edge_synth(clean, out_mp3, v, r))
+            if out_mp3.is_file() and out_mp3.stat().st_size > 1024:
+                return
+        except Exception as exc:
+            last_err = exc
+            print(f"[tts_gen] edge-tts attempt {idx}/{len(attempts)} failed ({exc}); retrying in {wait_s}s...")
+            time.sleep(wait_s)
+
+    # Fallback to gTTS (Indian Hindi) so workflow never crashes on transient Edge TTS IP blocks
+    try:
+        from gtts import gTTS
+
+        print(f"[tts_gen] Falling back to gTTS (Hindi) for {out_mp3.name}...")
+        gTTS(text=clean, lang="hi", tld="co.in", slow=False).save(str(out_mp3))
+        if out_mp3.is_file() and out_mp3.stat().st_size > 1024:
+            return
+    except Exception as g_exc:
+        print(f"[tts_gen] gTTS fallback failed: {g_exc}")
+
+    raise RuntimeError(f"TTS failed for {out_mp3.name}: {last_err}")
 
 
 def _fmt_srt_time(sec: float) -> str:
@@ -65,12 +111,13 @@ def _synthesize_batch(
     total = 0.0
     for i, scene in enumerate(scenes):
         mp3_path = work_dir / f"{prefix}_scene_{i:02d}.mp3"
-        asyncio.run(_synth_one(scene["narration"], mp3_path, voice, rate))
+        _synth_one_resilient(scene["narration"], mp3_path, voice, rate)
         dur = get_audio_duration(mp3_path)
         scene["audio_path"] = mp3_path
         scene["raw_duration"] = dur
         scene["duration"] = dur + pad
         total += scene["duration"]
+        time.sleep(0.6)  # polite pause to avoid Edge TTS rate-limiting
     return total
 
 
